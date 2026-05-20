@@ -6,6 +6,24 @@ Gurks Advanced AI Trading Bot is a Streamlit-based crypto trading dashboard for 
 
 This project is in active beta. Unknown bugs can exist. Start with tiny amounts, test in simulation/mock mode first, and review every setting before enabling live trading.
 
+## Screenshots
+
+Main dashboard:
+
+![Main dashboard and order book overview](./screenshots/20_main_dashboard_orderbook_overview.png)
+
+Advanced scan configuration:
+
+![Advanced AI Market Optimization](./screenshots/19_advanced_ai_market_optimization_main.png)
+
+Strategy analytics and learning:
+
+![Top 3 strategy records](./screenshots/12_top3_strategy_records_overview.png)
+
+![Self-learning memory](./screenshots/13_self_learning_memory_day.png)
+
+More screenshots and historical bug-reference images are stored in [`screenshots/IMAGE_DESCRIPTIONS.txt`](./screenshots/IMAGE_DESCRIPTIONS.txt).
+
 ## Exchange Support
 
 - Supported now: KuCoin spot trading through `ccxt`.
@@ -29,6 +47,133 @@ This project is in active beta. Unknown bugs can exist. Start with tiny amounts,
 - Optional login wall with PBKDF2-SHA256 hashed passwords. Login is off by default unless the user enables it.
 - KCS fee-model support for KuCoin fee discount modeling.
 - Runtime files are auto-created on first startup when missing.
+
+## Complete Feature Map
+
+This section is intentionally explicit so GitHub users can see what is already included in the current beta.
+
+### Trading Modes And Live Control
+
+- Swing Trading mode for slower trades and longer hold times.
+- Day Trading mode for shorter intraday trades.
+- Swing and Day can be started independently or together.
+- Each mode has its own capital frame, live settings, cooldowns and position memory.
+- Positions store their trading mode so a Swing result cannot be imported into the Day profile by mistake, and vice versa.
+- Manual test buy/sell buttons are clearly marked as manual system tests.
+
+### Persistent Bot Memory
+
+- `open_positions.json` stores open bot-managed positions so they survive hard restarts.
+- `mode_capital_state.json` tracks each mode's capital frame, realized PnL and reserved capital.
+- `last_trade_state.json` supports cooldown and duplicate-buy protection across reruns/restarts.
+- `trade_history.csv` stores completed trades.
+- Runtime files are created automatically on first startup when missing.
+
+### Self-Learning Memory
+
+- The bot stores scan, trade and market-regime outcomes in `learning_memory.jsonl`.
+- Aggregated learned patterns are stored in `learning_model.json`.
+- The learning model ranks what has historically worked by trading mode, timeframe and market regime.
+- Learned patterns can bias future scans toward historically stronger parameter zones.
+- Live trades can be used as stronger feedback than pure scan results when enough data exists.
+- The self-learning system is advisory by default: it does not change live settings automatically.
+- The UI can show learned recommendations and lets the user manually activate a learned recommendation.
+- Auto-switching is intentionally not enabled by default; it should only be considered after enough live evaluation data exists.
+- Local scan results can be merged/migrated to a VPS so the always-on bot benefits from stronger offline scans.
+
+### Strategy Scanning And Optimization
+
+- Background scanner with configurable scan capital, test period, minimum trades, workers, scan depth and auto interval.
+- Separate Swing, Day or combined scan modes.
+- Multiple scan timeframes can be selected; results keep their own tested timeframe.
+- Rolling Top 250 leaderboard in `optimization_results.csv`.
+- Top 3 strategy cards with separate Swing/Day views.
+- Top 3 cards compare candidates against the correct current live baseline.
+- Identical/live-equivalent candidates can be hidden so Top 3 shows actionable alternatives.
+- Bayesian/Optuna support when Optuna is installed.
+- Process-pool scanning with fallback logging through `opt_processpool_errors.txt`.
+- RAM-accelerated scan mode with configurable cache and CSV flush interval.
+- Optional shared-memory/fork-friendly scan data path where supported.
+- Scan-engine diagnostics in `scan_engine_diagnostics.json` for RAM/shared-memory state, cache size, worker count and cleanup verification.
+- Weighted/randomized scanning that adds variation without ignoring scoring, market relevance or selected safeguards.
+- Optional randomization of scan settings, coins and allocation, controlled separately.
+- Multi-coin ranking modes: all selected coins, majority, single-coin winners, hybrid and weighted ranking.
+- Strategy results can include per-coin coverage and the coins where the strategy performed best.
+
+### Optimization Metrics
+
+- Profit in USDT.
+- Win rate.
+- Trade count.
+- Fitness score.
+- Sharpe ratio.
+- Sortino ratio.
+- Max drawdown.
+- In-sample and out-of-sample Walk-Forward Analysis.
+- Coverage across selected coins.
+- Risk-adjusted ranking profiles, including profit-focused modes with fitness protection.
+
+### Strategy Parameters
+
+- RSI buy threshold.
+- Take Profit as ATR multiple.
+- Stop Loss as fixed percent or ATR multiple.
+- Trailing Stop Loss activation and distance.
+- Grid Trading spacing and grid levels.
+- Market-regime filter: trend, range and crash handling.
+- Volume and liquidity filters.
+- CMF / money-flow threshold.
+- Volume-spike multiplier.
+- Bollinger Band Width / squeeze-style filters.
+- Trading session filter.
+- Weekday filter.
+- Higher-timeframe trend filter.
+- Max bars in trade / time-exit.
+- Time-exit fee guard, so near break-even exits can be blocked when fees would eat the trade.
+- Minimum edge after estimated costs.
+- Max simultaneous positions.
+- Cooldown per coin.
+
+### Risk And Execution Protection
+
+- Duplicate-buy guard inside the live order path.
+- Persistent cooldown and last-trade memory.
+- Per-mode capital allocation and reserved capital tracking.
+- Fee-aware PnL and scan modeling.
+- KuCoin fee/KCS model support.
+- Realistic execution model with spread, expected slippage, worst slippage and maximum allowed live slippage.
+- Preset execution realism profiles.
+- Optional order-book calibration from KuCoin public order books.
+- Exit guard that can block fee-eating time exits.
+- Live order logs try to use actual KuCoin fee data when the exchange returns it.
+
+### Telegram And Notifications
+
+- Scheduled status reports even when no trades occurred.
+- Trade alerts for buys and sells.
+- Scan-completion reports.
+- Strategy/record alerts.
+- KCS reserve warnings when enabled.
+- Notification categories can be enabled/disabled from settings.
+- Telegram text follows the selected UI language where possible.
+- Manual Telegram tests are labeled as manual tests so they are not confused with real trades.
+
+### UI, Logs And Analytics
+
+- Discord-inspired dark UI theme.
+- English and Swedish language switching.
+- Optional login wall with PBKDF2-SHA256 hashed password storage.
+- Help section with setting explanations.
+- System Event Log for live trade/event messages.
+- Analysis log for market-scanning details.
+- Active holdings / open positions panel.
+- Historical Profit Chart.
+- Market Chart.
+- ROI Dashboard.
+- Time-of-day performance.
+- False Positive Analyzer.
+- Top 3 strategy cards with compact and detailed views.
+- Background scan status survives page refresh/device switch through status files.
 
 ## Current UI Panels
 
@@ -208,60 +353,12 @@ Optional runtime/performance controls:
 - `BOT_DISABLE_LOGIN`
 - `BOT_DISABLE_AUTORUN`
 
-## Files Safe To Commit
-
-- `bot.py`
-- `predict.py`
-- `backtest.py`
-- `README.md`
-- `requirements.txt`
-- `DEPENDENCIES.txt`
-- `HOW_TO_GET_STARTED.txt`
-- `HARDWARE_REQUIREMENTS.txt`
-- `FILES_TO_UPLOAD.txt`
-- `example.env`
-- `install_dependencies.bat`
-- `install_dependencies.sh`
-- `.gitignore`
-
-## Do Not Commit Private Or Runtime Files
-
-- `.env`
-- `secure_auth.json`
-- `secure_keys.json`
-- `bot_config.json`
-- `trade_history.csv`
-- `event_logs.txt`
-- `open_positions.json`
-- `optimization_results.csv`
-- `opt_progress.txt`
-- `opt_stop.txt`
-- `opt_engine_status.json`
-- `opt_processpool_errors.txt`
-- `analysis_status.json`
-- `telegram_report_state.json`
-- `portfolio_snapshots.json`
-- `strategy_alert_snapshot.json`
-- `live_strategy_baseline.json`
-- `strategy_live_performance.json`
-- `mode_capital_state.json`
-- `last_trade_state.json`
-- `trade_reasons.jsonl`
-- `bot_runtime_state.json`
-- `strategy_versions.json`
-- `missed_opportunities.jsonl`
-- `data_quality_report.json`
-- `false_positive_report.json`
-- `suppressed_errors.log`
-- `__pycache__/`
-- `venv/`
-
 ## Upcoming Development Roadmap
 
 Planned future work discussed for the project:
 
-- Stronger multiprocessing/shared-memory scan engine.
-- More advanced RAM-accelerated indicator cache.
+- Stronger multiprocessing/shared-memory scan engine. Current beta includes guarded shared-memory mapping, parent-owned cleanup and scan diagnostics; deeper explicit shared-memory benchmarking remains planned.
+- More advanced RAM-accelerated indicator cache. Current beta includes compact NumPy indicator arrays, RAM cache limits and flush controls; the next step is broader precomputed indicator reuse across scan cycles.
 - Smarter AI market-regime models.
 - Better portfolio/risk engine.
 - More exchange connectors, starting with Binance.
