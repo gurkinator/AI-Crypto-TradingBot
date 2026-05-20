@@ -47,6 +47,7 @@ OPT_EXPORT_FILE = os.path.join(BASE_DIR, "optimization_results.csv")
 OPT_PROGRESS_FILE = os.path.join(BASE_DIR, "opt_progress.txt")
 OPT_PROCESSPOOL_ERROR_FILE = os.path.join(BASE_DIR, "opt_processpool_errors.txt")
 OPT_ENGINE_STATUS_FILE = os.path.join(BASE_DIR, "opt_engine_status.json")
+SCAN_ENGINE_DIAGNOSTICS_FILE = os.path.join(BASE_DIR, "scan_engine_diagnostics.json")
 OPT_STOP_FILE = os.path.join(BASE_DIR, "opt_stop.txt")
 ANALYSIS_STATUS_FILE = os.path.join(BASE_DIR, "analysis_status.json")
 TELEGRAM_REPORT_STATE_FILE = os.path.join(BASE_DIR, "telegram_report_state.json")
@@ -83,6 +84,8 @@ LEARNING_LOCK = threading.RLock()
 MATRIX_WORKER_CONTEXT = None
 MATRIX_SHARED_MEMORY_HANDLES = []
 MATRIX_SHARED_MEMORY_ATEXIT_REGISTERED = False
+PARENT_SHARED_MEMORY_HANDLES = []
+PARENT_SHARED_MEMORY_ATEXIT_REGISTERED = False
 _SUPPRESSED_EXCEPTION_LAST_LOG = {}
 OPT_AUTO_RESTART_DELAY_SECONDS = 60 * 60
 UI_LIVE_BALANCE_TTL_SECONDS = 45
@@ -944,6 +947,12 @@ EN_REPLACEMENTS = [
     ("Kunde inte spara", "Could not save"),
     ("Hämtade ledig likviditet", "Fetched available liquidity"),
     ("Ledig likviditet är", "Available liquidity is"),
+    ("Nästa bakgrundsskanning", "Next background scan"),
+    ("startar om", "starts in"),
+    ("vid ca", "around"),
+    ("min efter avslutad skanning", "min after the previous scan completed"),
+    ("Ange minst en valuta innan skanningen startas", "Select at least one coin before starting the scan"),
+    ("Antalet valutor och procentvärden måste matcha", "The number of coins and allocation percentages must match"),
     ("har minsta tillåtna värde", "has the minimum allowed value"),
     ("Tröskel:", "Threshold:"),
     ("Källa:", "Source:"),
@@ -964,6 +973,12 @@ EN_REPLACEMENTS = [
     ("Jämförelse mot", "Comparison against"),
     ("liveinställningar", "live settings"),
     ("Snabb bedömning", "Quick assessment"),
+    ("Befintliga inställningar", "Current live settings"),
+    ("Ingen sparad livebaslinje finns ännu för detta läge. Aktivera en strategi eller kör ett liveinställningstest för att få en exakt jämförelse.", "No saved live baseline exists for this mode yet. Activate a strategy or run a live-settings test to get an exact comparison."),
+    ("Dessa inlärda parametrar kan vikta framtida skanningar, men liveinställningar ändras inte förrän du aktiverar en profil manuellt.", "These learned parameters may bias future scans, but live settings are not changed until you manually activate a profile."),
+    ("Gridsteg", "Grid step"),
+    ("Regim", "Regime"),
+    ("Volymspike", "Volume spike"),
     ("Mätt över totalt", "Measured over"),
     ("Livejämförelse", "Live comparison"),
     ("Skannade kryptos", "Scanned cryptos"),
@@ -1307,7 +1322,13 @@ def is_telegram_category_enabled(category="general", cfg=None):
 
 
 def is_english_language(language_code=None):
-    return normalize_ui_language(language_code if language_code is not None else get_notification_language()) == "en"
+    """Return whether a specific language, or the active UI language, is English.
+
+    Background/Telegram code passes an explicit language_code. UI code calls this
+    without arguments, so the default must follow the current Streamlit UI state,
+    not only the saved notification/config language.
+    """
+    return normalize_ui_language(language_code if language_code is not None else get_ui_language()) == "en"
 
 
 def translate_ui_text(value):
@@ -1333,7 +1354,15 @@ def translate_visible_log_text(value):
     if not isinstance(value, str):
         return value
     try:
-        cleaned = value.replace("b?ttre", "bättre")
+        cleaned = (
+            value
+            .replace("b?ttre", "bättre")
+            .replace("Î”", "Δ")
+            .replace("âˆ†", "Δ")
+            .replace("î”", "Δ")
+        )
+        if get_ui_language() == "en":
+            cleaned = cleaned.replace("Δ", "Change")
         return translate_ui_text(cleaned)
     except Exception as _suppressed_exc:
         _log_suppressed_exception('translate_visible_log_text', _suppressed_exc)
@@ -2098,6 +2127,34 @@ def write_opt_engine_status(engine, matrix_choice="", workers=None, total_worker
         atomic_write_json_file(OPT_ENGINE_STATUS_FILE, payload, indent=2)
     except Exception as _suppressed_exc:
         _log_suppressed_exception('write_opt_engine_status', _suppressed_exc)
+
+
+def write_scan_engine_diagnostics(payload):
+    """Persist lightweight scanner diagnostics for RAM/shared-memory and worker QA."""
+    try:
+        existing_payload = {}
+        if os.path.exists(SCAN_ENGINE_DIAGNOSTICS_FILE):
+            try:
+                with open(SCAN_ENGINE_DIAGNOSTICS_FILE, "r", encoding="utf-8-sig") as f_diag:
+                    loaded_diag = json.load(f_diag)
+                if isinstance(loaded_diag, dict):
+                    existing_payload = loaded_diag
+            except Exception as read_diag_exc:
+                _log_suppressed_exception('write_scan_engine_diagnostics_read_existing', read_diag_exc, min_interval_seconds=300)
+        diagnostic_payload = {
+            "schema": "scan_engine_diagnostics_v1",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "os_name": os.name,
+            "platform": os.sys.platform,
+            "cpu_count": int(os.cpu_count() or 1),
+        }
+        diagnostic_payload.update(existing_payload)
+        if isinstance(payload, dict):
+            diagnostic_payload.update(payload)
+        diagnostic_payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        atomic_write_json_file(SCAN_ENGINE_DIAGNOSTICS_FILE, diagnostic_payload, indent=2)
+    except Exception as _suppressed_exc:
+        _log_suppressed_exception('write_scan_engine_diagnostics', _suppressed_exc)
 
 
 def _write_json_file_if_missing(path, payload):
@@ -2909,6 +2966,52 @@ def format_bytes_short(byte_count):
     return f"{size_value:.1f} TB"
 
 
+def _shared_memory_handle_key(shm):
+    try:
+        return str(getattr(shm, "name", "") or getattr(shm, "_name", "") or id(shm))
+    except Exception as _suppressed_exc:
+        _log_suppressed_exception('_shared_memory_handle_key', _suppressed_exc)
+        return str(id(shm))
+
+
+def register_parent_shared_memory_handles(handles):
+    """Keep parent-created shared memory unlinkable even if a scan is interrupted."""
+    global PARENT_SHARED_MEMORY_HANDLES, PARENT_SHARED_MEMORY_ATEXIT_REGISTERED
+    clean_handles = [handle for handle in (handles or []) if handle is not None]
+    if not clean_handles:
+        return
+    try:
+        existing = {_shared_memory_handle_key(handle) for handle in PARENT_SHARED_MEMORY_HANDLES}
+        for handle in clean_handles:
+            if _shared_memory_handle_key(handle) not in existing:
+                PARENT_SHARED_MEMORY_HANDLES.append(handle)
+        if not PARENT_SHARED_MEMORY_ATEXIT_REGISTERED:
+            PARENT_SHARED_MEMORY_ATEXIT_REGISTERED = True
+            atexit.register(cleanup_parent_shared_memory_handles)
+    except Exception as _suppressed_exc:
+        _log_suppressed_exception('register_parent_shared_memory_handles', _suppressed_exc)
+
+
+def unregister_parent_shared_memory_handles(handles):
+    global PARENT_SHARED_MEMORY_HANDLES
+    try:
+        remove_keys = {_shared_memory_handle_key(handle) for handle in (handles or []) if handle is not None}
+        if remove_keys:
+            PARENT_SHARED_MEMORY_HANDLES = [
+                handle for handle in PARENT_SHARED_MEMORY_HANDLES
+                if _shared_memory_handle_key(handle) not in remove_keys
+            ]
+    except Exception as _suppressed_exc:
+        _log_suppressed_exception('unregister_parent_shared_memory_handles', _suppressed_exc)
+
+
+def cleanup_parent_shared_memory_handles():
+    global PARENT_SHARED_MEMORY_HANDLES
+    handles = PARENT_SHARED_MEMORY_HANDLES
+    PARENT_SHARED_MEMORY_HANDLES = []
+    cleanup_shared_memory_handles(handles, unregister_parent=False)
+
+
 def compact_np_data_for_ram_scan(np_data):
     """Gor worker-datan mer RAM- och cachevanlig utan att andra delar av botten andras."""
     compacted = {}
@@ -2965,6 +3068,7 @@ def create_shared_memory_np_data(np_data):
                     "nbytes": int(np_arr.nbytes),
                 }
             descriptors[coin] = coin_descriptors
+        register_parent_shared_memory_handles(handles)
         return descriptors, handles, total_bytes
     except Exception as _suppressed_exc:
         _log_suppressed_exception('create_shared_memory_np_data', _suppressed_exc)
@@ -3041,7 +3145,7 @@ def close_worker_shared_memory_handles():
             _log_suppressed_exception('close_worker_shared_memory_handles', close_exc)
 
 
-def cleanup_shared_memory_handles(handles):
+def cleanup_shared_memory_handles(handles, unregister_parent=True):
     for shm in handles or []:
         try:
             shm.close()
@@ -3053,6 +3157,8 @@ def cleanup_shared_memory_handles(handles):
             pass
         except Exception as unlink_exc:
             _log_suppressed_exception('cleanup_shared_memory_unlink', unlink_exc)
+    if unregister_parent:
+        unregister_parent_shared_memory_handles(handles)
 
 
 def format_worker_reservation_note(detected_cpu_count=None):
@@ -4674,7 +4780,7 @@ def save_optimization_and_alert_settings():
                 o_pcts = [int(p.strip()) for p in opt_pcts_raw.split(',') if p.strip()]
 
                 if not o_coins:
-                    st.session_state.opt_progress_text = "❌ Ange minst en valuta innan skanningen startas."
+                    st.session_state.opt_progress_text = translate_ui_text("❌ Ange minst en valuta innan skanningen startas.")
                     write_opt_progress_status(st.session_state.opt_progress_text, running=False)
                     st.session_state.optimization_active = False
                     cfg["optimization_active_saved"] = False
@@ -4682,7 +4788,7 @@ def save_optimization_and_alert_settings():
                     return
 
                 if len(o_coins) != len(o_pcts):
-                    st.session_state.opt_progress_text = "❌ Antalet valutor och procentvärden måste matcha."
+                    st.session_state.opt_progress_text = translate_ui_text("❌ Antalet valutor och procentvärden måste matcha.")
                     write_opt_progress_status(st.session_state.opt_progress_text, running=False)
                     st.session_state.optimization_active = False
                     cfg["optimization_active_saved"] = False
@@ -4971,7 +5077,7 @@ def render_optimization_status_fragment():
         set_optimization_cooldown_status()
         cooldown_remaining = opt_auto_restart_remaining_seconds()
     current_status_text = translate_visible_log_text(str(st.session_state.get('opt_progress_text', 'Viloläge. Avaktiverad.')))
-    st.info(f"{current_status_text}")
+    st.info(translate_visible_log_text(str(current_status_text)))
 
     if (
         st.session_state.get("optimization_active", False)
@@ -5440,6 +5546,24 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
             np_data = compact_np_data_for_ram_scan(np_data)
             after_ram_bytes = estimate_np_data_bytes(np_data)
             cache_cap_bytes = int(ram_scan_settings["cache_gb"]) * 1024 * 1024 * 1024
+            write_scan_engine_diagnostics({
+                "phase": "ram_data_prepared",
+                "matrix_choice": str(matrix_choice),
+                "timeframe": str(actual_tf_string),
+                "scan_days": int(scan_days),
+                "coin_count": int(len(np_data)),
+                "ram_scan_enabled": True,
+                "ram_cache_gb": int(ram_scan_settings["cache_gb"]),
+                "ram_csv_flush_seconds": float(ram_scan_settings["flush_seconds"]),
+                "shared_memory_requested": bool(ram_scan_settings["shared_memory"]),
+                "indicator_bytes_before": int(before_ram_bytes),
+                "indicator_bytes_after": int(after_ram_bytes),
+                "indicator_size_before": format_bytes_short(before_ram_bytes),
+                "indicator_size_after": format_bytes_short(after_ram_bytes),
+                "cache_cap_bytes": int(cache_cap_bytes),
+                "cache_cap_size": format_bytes_short(cache_cap_bytes),
+                "cache_cap_exceeded": bool(after_ram_bytes > cache_cap_bytes),
+            })
             if ram_scan_settings["shared_memory"] and os.name != "nt":
                 shared_note = "shared memory via Linux fork/COW"
             elif ram_scan_settings["shared_memory"]:
@@ -5457,6 +5581,22 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
                     f"(före {format_bytes_short(before_ram_bytes)}), maxcache {ram_scan_settings['cache_gb']} GB, "
                     f"{shared_note}, CSV flush {ram_scan_settings['flush_seconds']:.0f}s."
                 )
+        else:
+            plain_bytes = estimate_np_data_bytes(np_data)
+            write_scan_engine_diagnostics({
+                "phase": "indicator_data_prepared",
+                "matrix_choice": str(matrix_choice),
+                "timeframe": str(actual_tf_string),
+                "scan_days": int(scan_days),
+                "coin_count": int(len(np_data)),
+                "ram_scan_enabled": False,
+                "shared_memory_requested": False,
+                "shared_memory_enabled": False,
+                "indicator_bytes": int(plain_bytes),
+                "indicator_size": format_bytes_short(plain_bytes),
+                "workers_requested": int(num_workers),
+                "cpu_count": int(multiprocessing.cpu_count()),
+            })
 
         local_np_data = dict(np_data)
         process_np_data = local_np_data
@@ -5467,12 +5607,37 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
             if process_np_data_candidate and shared_memory_handles:
                 process_np_data = process_np_data_candidate
                 shared_memory_enabled = True
+                write_scan_engine_diagnostics({
+                    "phase": "shared_memory_ready",
+                    "matrix_choice": str(matrix_choice),
+                    "timeframe": str(actual_tf_string),
+                    "scan_days": int(scan_days),
+                    "coin_count": int(len(local_np_data)),
+                    "ram_scan_enabled": True,
+                    "shared_memory_enabled": True,
+                    "shared_memory_bytes": int(shared_memory_bytes),
+                    "shared_memory_size": format_bytes_short(shared_memory_bytes),
+                    "shared_memory_segments": int(len(shared_memory_handles)),
+                    "workers_requested": int(num_workers),
+                    "cpu_count": int(multiprocessing.cpu_count()),
+                })
                 send_status(
                     f"🧠 Shared memory aktiv: {format_bytes_short(shared_memory_bytes)} NumPy-data mappas direkt i process-workers. "
                     "UI/status fortsätter uppdateras via throttlad disk/kö."
                 )
             else:
                 shared_memory_handles = []
+                write_scan_engine_diagnostics({
+                    "phase": "shared_memory_fallback",
+                    "matrix_choice": str(matrix_choice),
+                    "timeframe": str(actual_tf_string),
+                    "scan_days": int(scan_days),
+                    "coin_count": int(len(local_np_data)),
+                    "ram_scan_enabled": True,
+                    "shared_memory_enabled": False,
+                    "workers_requested": int(num_workers),
+                    "cpu_count": int(multiprocessing.cpu_count()),
+                })
                 send_status("⚠️ Shared memory kunde inte initieras. Fortsätter med RAM-kompakt data/fork-COW fallback.")
         original_pct_map = {
             normalize_coin_symbol_list([coin])[0]: max(0, int(pct))
@@ -6271,6 +6436,9 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
                             "fitness_metric": fitness_metric,
                             "walk_forward": bool(use_walk_forward),
                             "trial_budget": int(total_combinations),
+                            "ram_scan_enabled": bool(ram_scan_settings.get("enabled", False)),
+                            "shared_memory_enabled": bool(shared_memory_enabled),
+                            "shared_memory_segments": int(len(shared_memory_handles)),
                         },
                     )
                     send_status(f"🧠 MOTOR: OPTUNA PROCESSPOOL. Startar Bayes/Optuna-processpool med {num_workers}/{multiprocessing.cpu_count()} workers och {total_combinations:,} trials. Fitness: {fitness_metric}. WFA: {'på' if use_walk_forward else 'av'}.{min_trades_note}{format_worker_reservation_note(multiprocessing.cpu_count())}")
@@ -6288,6 +6456,9 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
                             "fitness_metric": fitness_metric,
                             "walk_forward": bool(use_walk_forward),
                             "trial_budget": int(total_combinations),
+                            "ram_scan_enabled": bool(ram_scan_settings.get("enabled", False)),
+                            "shared_memory_enabled": bool(shared_memory_enabled),
+                            "shared_memory_segments": int(len(shared_memory_handles)),
                         },
                     )
                     send_status(f"⚙️ MOTOR: PROCESSPOOL. Startar processpool med {num_workers}/{multiprocessing.cpu_count()} workers.{min_trades_note}{format_worker_reservation_note(multiprocessing.cpu_count())} Resultat sparas löpande till CSV.")
@@ -6306,6 +6477,9 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
                         "fitness_metric": fitness_metric,
                         "walk_forward": bool(use_walk_forward),
                         "trial_budget": int(total_combinations),
+                        "ram_scan_enabled": bool(ram_scan_settings.get("enabled", False)),
+                        "shared_memory_enabled": bool(shared_memory_enabled),
+                        "shared_memory_segments": int(len(shared_memory_handles)),
                     },
                 )
                 try:
@@ -6338,6 +6512,9 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
                     "fitness_metric": fitness_metric,
                     "walk_forward": bool(use_walk_forward),
                     "trial_budget": int(total_combinations),
+                    "ram_scan_enabled": bool(ram_scan_settings.get("enabled", False)),
+                    "shared_memory_enabled": bool(shared_memory_enabled),
+                    "shared_memory_segments": int(len(shared_memory_handles)),
                 },
             )
             fallback_workers = get_thread_fallback_worker_count(matrix_choice, num_workers, multiprocessing.cpu_count())
@@ -6389,6 +6566,21 @@ def bg_optimization_task(o_coins, o_pcts, opt_tf, opt_balance, opt_coins_raw, op
             cleanup_shared_memory_handles(locals().get("shared_memory_handles", []))
         except Exception as cleanup_err:
             _log_suppressed_exception('bg_optimization_shared_memory_cleanup', cleanup_err)
+        try:
+            write_scan_engine_diagnostics({
+                "phase": "scan_finished_cleanup_complete",
+                "matrix_choice": str(locals().get("matrix_choice", "")),
+                "timeframe": str(locals().get("actual_tf_string", "")),
+                "scan_days": int(locals().get("scan_days", 0) or 0),
+                "ram_scan_enabled": bool(locals().get("ram_scan_settings", {}).get("enabled", False)) if isinstance(locals().get("ram_scan_settings", {}), dict) else False,
+                "shared_memory_enabled": bool(locals().get("shared_memory_enabled", False)),
+                "shared_memory_handles_remaining": int(len(PARENT_SHARED_MEMORY_HANDLES)),
+                "workers_requested": int(locals().get("num_workers", 0) or 0),
+                "cpu_count": int(multiprocessing.cpu_count()),
+                "stopped_by_user": bool(should_stop()),
+            })
+        except Exception as diag_cleanup_err:
+            _log_suppressed_exception('bg_optimization_diagnostics_cleanup', diag_cleanup_err)
         if not _single_timeframe_run:
             mark_optimization_cycle_finished()
             send_finished()
@@ -6409,11 +6601,11 @@ def start_background_optimization_from_config(cfg=None, status_text="📥 Starta
         o_pcts = [int(p.strip()) for p in str(cfg.get("opt_pcts_raw", "20,20,20,20,20")).split(',') if p.strip()]
 
         if not o_coins:
-            st.session_state.opt_progress_text = "❌ Ange minst en valuta innan skanningen startas."
+            st.session_state.opt_progress_text = translate_ui_text("❌ Ange minst en valuta innan skanningen startas.")
             write_opt_progress_status(st.session_state.opt_progress_text, running=False)
             return False, st.session_state.opt_progress_text
         if len(o_coins) != len(o_pcts):
-            st.session_state.opt_progress_text = "❌ Antalet valutor och procentvärden måste matcha."
+            st.session_state.opt_progress_text = translate_ui_text("❌ Antalet valutor och procentvärden måste matcha.")
             write_opt_progress_status(st.session_state.opt_progress_text, running=False)
             return False, st.session_state.opt_progress_text
 
@@ -6513,10 +6705,13 @@ def reconcile_optimization_checkbox_state():
         return False
 
 
-def set_optimization_cooldown_status(prefix="⏳ Nästa bakgrundsskanning"):
+def set_optimization_cooldown_status(prefix=None):
     remaining = opt_auto_restart_remaining_seconds()
     if remaining <= 0:
         return 0
+    english = is_english_language()
+    if prefix is None:
+        prefix = "⏳ Next background scan" if english else "⏳ Nästa bakgrundsskanning"
     try:
         payload = load_opt_progress_payload()
         next_run_after = payload.get("next_run_after")
@@ -6529,13 +6724,19 @@ def set_optimization_cooldown_status(prefix="⏳ Nästa bakgrundsskanning"):
         next_run_text = ""
         if next_run_after:
             next_run_text = datetime.fromisoformat(next_run_after).strftime("%H:%M")
-        suffix = f" vid ca {next_run_text}" if next_run_text else ""
+        suffix = f" around {next_run_text}" if (english and next_run_text) else (f" vid ca {next_run_text}" if next_run_text else "")
         interval_minutes = int(get_opt_auto_restart_delay_seconds() / 60)
-        st.session_state.opt_progress_text = f"{prefix} startar om {format_seconds_short(remaining)}{suffix} ({interval_minutes} min efter avslutad skanning)."
+        if english:
+            st.session_state.opt_progress_text = f"{prefix} starts in {format_seconds_short(remaining)}{suffix} ({interval_minutes} min after the previous scan completed)."
+        else:
+            st.session_state.opt_progress_text = f"{prefix} startar om {format_seconds_short(remaining)}{suffix} ({interval_minutes} min efter avslutad skanning)."
     except Exception as _suppressed_exc:
         _log_suppressed_exception('bare_except_L4492', _suppressed_exc)
         interval_minutes = int(get_opt_auto_restart_delay_seconds() / 60)
-        st.session_state.opt_progress_text = f"{prefix} startar om {format_seconds_short(remaining)} ({interval_minutes} min efter avslutad skanning)."
+        if english:
+            st.session_state.opt_progress_text = f"{prefix} starts in {format_seconds_short(remaining)} ({interval_minutes} min after the previous scan completed)."
+        else:
+            st.session_state.opt_progress_text = f"{prefix} startar om {format_seconds_short(remaining)} ({interval_minutes} min efter avslutad skanning)."
     write_opt_progress_status(st.session_state.opt_progress_text, running=False)
     return remaining
 
@@ -6732,7 +6933,7 @@ def render_live_top3_ticker_fragment(selected_mode="day"):
             diff_pct = _safe_float(item.get("diff_pct", 0.0), 0.0)
             fitness = _safe_float(row.get("Fitness_Score", 0.0), 0.0)
             max_dd = _safe_float(row.get("Max_Drawdown_Pct", 0.0), 0.0)
-            quality = str(item.get("quality_vs_live", "") or "").strip()
+            quality = translate_visible_log_text(str(item.get("quality_vs_live", "") or "").strip())
             if english:
                 lines.append(
                     f"#{rank} {quality} | vs live {diff_profit:+.2f} USDT ({diff_pct:+.2f}%) | "
@@ -10193,6 +10394,18 @@ def bootstrap_runtime_storage_files():
         _write_text_file_if_missing(EVENT_LOG_FILE, "")
         _write_text_file_if_missing(SUPPRESSED_EXCEPTION_FILE, "")
         _write_text_file_if_missing(OPT_PROCESSPOOL_ERROR_FILE, "")
+        _write_json_file_if_missing(OPT_ENGINE_STATUS_FILE, {})
+        _write_json_file_if_missing(
+            SCAN_ENGINE_DIAGNOSTICS_FILE,
+            {
+                "schema": "scan_engine_diagnostics_v1",
+                "updated_at": "",
+                "phase": "idle",
+                "shared_memory_enabled": False,
+                "ram_scan_enabled": False,
+                "note": "Created automatically. Updated by background scans."
+            }
+        )
         _write_json_file_if_missing(
             OPT_PROGRESS_FILE,
             {
@@ -12310,7 +12523,7 @@ def evaluate_strategy_alert_conditions(best, row, live_reference_metrics, opt_ba
         passed = value is not None and value >= threshold
         unit = "%" if metric == "Procent (%)" else (" p.e." if metric == "Max DD" else "")
         if value is None:
-            text = f"{metric}: Î” saknas, krav {threshold:g}{unit}"
+            text = f"{metric}: skillnad saknas, krav {threshold:g}{unit}"
         else:
             text = f"{metric}: {value:+.2f}{unit} / krav {threshold:g}{unit}"
         details.append({"metric": metric, "value": value, "threshold": threshold, "passed": passed, "text": text})
@@ -14218,7 +14431,7 @@ def render_learning_memory_panel(selected_mode=None):
                         def _learning_delta_label(current_value, baseline_value, decimals=2, lower_is_better=False, suffix=""):
                             baseline_value = _optional_float(baseline_value)
                             if baseline_value is None:
-                                return "Î” missing" if english else "Î” saknas"
+                                return "change missing" if english else "skillnad saknas"
                             current_value = _safe_float(current_value, 0.0)
                             delta = (baseline_value - current_value) if lower_is_better else (current_value - baseline_value)
                             icon = "🟢" if delta > 0 else ("🔴" if delta < 0 else "⚖️")
@@ -14914,7 +15127,7 @@ def format_trade_quality_benchmarks(trading_mode=None, scan_days=None):
 def localize_quality_label(label):
     """Translate compact quality labels used inside dynamic Top 3 cards."""
     text = str(label or "")
-    if get_ui_language() != "en":
+    if not is_english_language():
         return text
     replacements = {
         "Mycket bättre": "Much better",
@@ -14997,13 +15210,15 @@ def metric_quality(metric_name, value, trades=None, trading_mode=None, scan_days
 
 
 def _metric_delta_text(current_value, live_value, decimals=2, lower_is_better=False):
+    english = get_ui_language() == "en"
     if live_value is None:
-        return "Î” live: missing" if get_ui_language() == "en" else "Î” live: saknas"
+        return "live change: missing" if english else "liveändring: saknas"
     current_value = _safe_float(current_value, 0.0)
     live_value = _safe_float(live_value, 0.0)
     delta = (live_value - current_value) if lower_is_better else (current_value - live_value)
     icon = "🟢" if delta > 0 else ("🔴" if delta < 0 else "⚖️")
-    return f"{icon} Î” {delta:+.{decimals}f}"
+    label = "change" if english else "skillnad"
+    return f"{icon} {label} {delta:+.{decimals}f}"
 
 
 def classify_strategy_vs_live(diff_profit, diff_pct, is_identical=False):
@@ -15106,7 +15321,7 @@ def format_live_metric_comparison_line(r_fitness, r_sharpe, r_sortino, r_dd, liv
     for name, current_value, live_value, decimals, lower_is_better, unit in metric_specs:
         live_value = _optional_float(live_value)
         if live_value is None:
-            items.append(f"{name}: {'Î” missing' if english else 'Î” saknas'}")
+            items.append(f"{name}: {'change missing' if english else 'skillnad saknas'}")
             continue
         current_value = _safe_float(current_value, 0.0)
         delta = (live_value - current_value) if lower_is_better else (current_value - live_value)
@@ -15323,7 +15538,7 @@ def check_and_send_strategy_alerts(force=False):
         value = item.get("value")
         unit = "%" if metric == "Procent (%)" else (" p.p." if metric == "Max DD" else "")
         if value is None:
-            missing_label = "Î” missing, required" if english else "Î” saknas, krav"
+            missing_label = "change missing, required" if english else "skillnad saknas, krav"
             return f"{metric_label}: {missing_label} {threshold:g}{unit}"
         required_label = "required" if english else "krav"
         return f"{metric_label}: {_safe_float(value):+.2f}{unit} / {required_label} {threshold:g}{unit}"
@@ -17441,7 +17656,7 @@ def show_analysis_log_window():
             st.info("The system is idle. Start live monitoring to see live signals." if english else "Systemet är i viloläge. Starta botten för att se livesignaler.")
 
 
-@st.dialog("❔ Hjälpavsnitt", width="large")
+@st.dialog(translate_ui_text("❔ Hjälpavsnitt"), width="large")
 def help_popup():
     if get_ui_language() == "en":
         st.markdown(
@@ -18020,73 +18235,94 @@ def help_popup():
         )
 
     st.write("---")
-    if st.button("Stäng hjälpavsnitt", width="stretch", key="close_help_dialog_btn"):
+    if st.button("Close help" if is_english_language() else "Stäng hjälpavsnitt", width="stretch", key="close_help_dialog_btn"):
         st.rerun()
 
 
-@st.dialog("Bekräfta rensning")
+@st.dialog(translate_ui_text("Bekräfta rensning"))
 def confirm_clear_event_log_dialog(source_key="main"):
-    st.warning("Är du säker på att du vill rensa händelseloggen?")
-    st.caption("Detta rensar bara händelseloggen/event_logs.txt. Orderhistorikens CSV-fil rensas inte av den här knappen.")
+    english_dialog = is_english_language()
+    st.warning("Are you sure you want to clear the event log?" if english_dialog else "Är du säker på att du vill rensa händelseloggen?")
+    st.caption(
+        "This only clears the event log/event_logs.txt. The order-history CSV is not cleared by this button."
+        if english_dialog else
+        "Detta rensar bara händelseloggen/event_logs.txt. Orderhistorikens CSV-fil rensas inte av den här knappen."
+    )
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
-        if st.button("Ja, töm händelseloggen", type="primary", width="stretch", key=f"confirm_clear_event_log_{source_key}"):
+        if st.button("Yes, clear the event log" if english_dialog else "Ja, töm händelseloggen", type="primary", width="stretch", key=f"confirm_clear_event_log_{source_key}"):
             clear_event_logs()
-            st.toast("Händelseloggen har tömts.", icon="🧹")
+            st.toast("The event log has been cleared." if english_dialog else "Händelseloggen har tömts.", icon="🧹")
             close_dialog_with_app_rerun(source_key)
     with cancel_col:
-        if st.button("Avbryt", width="stretch", key=f"cancel_clear_event_log_{source_key}"):
+        if st.button("Cancel" if english_dialog else "Avbryt", width="stretch", key=f"cancel_clear_event_log_{source_key}"):
             close_dialog_with_app_rerun(source_key)
 
 
-@st.dialog("Bekräfta rensning av orderhistorik")
+@st.dialog(translate_ui_text("Bekräfta rensning av orderhistorik"))
 def confirm_clear_order_history_dialog():
-    st.error("Är du säker på att du vill rensa all orderhistorik?")
-    st.caption("Detta rensar trade_history.csv och nollställer lokala diagram-/simuleringscachar. Händelseloggen behålls.")
+    english_dialog = is_english_language()
+    st.error("Are you sure you want to clear all order history?" if english_dialog else "Är du säker på att du vill rensa all orderhistorik?")
+    st.caption(
+        "This clears trade_history.csv and resets local chart/simulation caches. The event log is kept."
+        if english_dialog else
+        "Detta rensar trade_history.csv och nollställer lokala diagram-/simuleringscachar. Händelseloggen behålls."
+    )
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
-        if st.button("Ja, rensa CSV-historiken", type="primary", width="stretch", key="confirm_clear_order_history_csv"):
+        if st.button("Yes, clear the CSV history" if english_dialog else "Ja, rensa CSV-historiken", type="primary", width="stretch", key="confirm_clear_order_history_csv"):
             try:
                 clear_order_history_csv()
-                append_system_event("ORDERHISTORIK: Orderhistoriken rensades manuellt. Händelseloggen behölls.")
-                st.toast("Orderhistoriken har rensats. Händelseloggen behölls.", icon="🧹")
+                append_system_event("ORDER HISTORY: Order history was cleared manually. The event log was kept." if english_dialog else "ORDERHISTORIK: Orderhistoriken rensades manuellt. Händelseloggen behölls.")
+                st.toast("Order history has been cleared. The event log was kept." if english_dialog else "Orderhistoriken har rensats. Händelseloggen behölls.", icon="🧹")
                 st.rerun()
             except Exception as e:
-                st.error(f"Kunde inte rensa filer: {e}")
+                st.error(f"Could not clear files: {e}" if english_dialog else f"Kunde inte rensa filer: {e}")
     with cancel_col:
-        if st.button("Avbryt", width="stretch", key="cancel_clear_order_history_csv"):
+        if st.button("Cancel" if english_dialog else "Avbryt", width="stretch", key="cancel_clear_order_history_csv"):
             st.rerun()
 
 
 # --- DIALOGRUTA FÖR INSTÄLLNINGAR ---
-@st.dialog("⚙️ Inställningar & Strategi", width="large")
+@st.dialog(translate_ui_text("⚙️ Inställningar & Strategi"), width="large")
 def settings_popup():
     st.session_state.settings_open = True
-    tab1, tab2, tab3, tab4 = st.tabs([" System & Risk", " Indikatorfilter 🚀", " Risk & Vinstmål 💰", " 🔒 Portfölj"])
+    english_ui = is_english_language()
+    tab1, tab2, tab3, tab4 = st.tabs([
+        " System & Risk" if english_ui else " System & Risk",
+        " Indicator Filters 🚀" if english_ui else " Indikatorfilter 🚀",
+        " Risk & Profit Targets 💰" if english_ui else " Risk & Vinstmål 💰",
+        " 🔒 Portfolio" if english_ui else " 🔒 Portfölj",
+    ])
     
     with tab1:
-        st.subheader(" Global Nödbroms & Rapportering")
+        st.subheader(" Global Emergency Stop & Reporting" if english_ui else " Global Nödbroms & Rapportering")
         current_mode = get_active_trading_mode()
         mode_labels = [TRADING_MODE_LABELS["swing"], TRADING_MODE_LABELS["day"]]
         selected_mode_label = st.radio(
-            "Tradingläge",
+            "Trading mode" if english_ui else "Tradingläge",
             mode_labels,
             index=mode_labels.index(get_trading_mode_label(current_mode)),
             horizontal=True,
-            help="Swing är längre trades. Day är intradag med tightare risk, kortare hold och högre volymkrav."
+            help="Swing holds positions longer. Day Trading uses tighter risk, shorter holding time and stricter volume requirements." if english_ui else "Swing är längre trades. Day är intradag med tightare risk, kortare hold och högre volymkrav."
         )
         selected_mode = normalize_trading_mode(selected_mode_label)
         if selected_mode != current_mode:
             switch_trading_mode(selected_mode)
-            st.toast(f"{get_trading_mode_label(selected_mode)} aktiverat och dess sparade profil laddades.", icon="🔄")
+            st.toast(
+                f"{get_trading_mode_label(selected_mode)} enabled and its saved profile was loaded."
+                if english_ui else
+                f"{get_trading_mode_label(selected_mode)} aktiverat och dess sparade profil laddades.",
+                icon="🔄"
+            )
             st.rerun()
-        st.markdown("**Live-lägen & separata kapitalramar:**")
+        st.markdown("**Live modes & separate capital frames:**" if english_ui else "**Live-lägen & separata kapitalramar:**")
         saved_live_modes = normalize_active_trading_modes(load_bot_config().get("active_trading_modes", [current_mode]), allow_empty=True)
         active_mode_labels = st.multiselect(
-            "Lägen som får handla live samtidigt",
+            "Modes allowed to trade live at the same time" if english_ui else "Lägen som får handla live samtidigt",
             options=mode_labels,
             default=[get_trading_mode_label(mode) for mode in saved_live_modes],
-            help="Du kan låta Swing och Day Trading köra parallellt. Varje läge får egen kapitalram och eget positionsminne."
+            help="Swing and Day Trading can run in parallel. Each mode has its own capital frame and position memory." if english_ui else "Du kan låta Swing och Day Trading köra parallellt. Varje läge får egen kapitalram och eget positionsminne."
         )
         selected_live_modes = normalize_active_trading_modes([normalize_trading_mode(label) for label in active_mode_labels], allow_empty=True)
         st.session_state.active_trading_modes = selected_live_modes
@@ -18096,24 +18332,33 @@ def settings_popup():
                 cap_cfg = get_mode_capital_config(load_bot_config(), mode)
                 runtime_cap = get_mode_capital_runtime(mode)
                 st.number_input(
-                    f"{get_trading_mode_label(mode)} startkapital (USDT)",
+                    f"{get_trading_mode_label(mode)} start capital (USDT)" if english_ui else f"{get_trading_mode_label(mode)} startkapital (USDT)",
                     min_value=0.0,
                     value=float(cap_cfg.get("start_capital_usdt", 0.0)),
                     step=10.0,
                     key=f"{mode}_capital_usdt_input",
-                    help="Detta är lägets ursprungliga kapitalram. Efter trades räknar botten med realiserad PnL och öppna positioner så den inte tror att hela startkapitalet fortfarande är fritt."
+                    help="This is the mode's original capital frame. After trades, realized PnL and open positions are counted so the bot does not treat the full start capital as free." if english_ui else "Detta är lägets ursprungliga kapitalram. Efter trades räknar botten med realiserad PnL och öppna positioner så den inte tror att hela startkapitalet fortfarande är fritt."
                 )
                 st.caption(
-                    f"Status: {'aktiv' if mode in selected_live_modes else 'av'} | "
-                    f"Eget kapital {_fmt_usdt(runtime_cap.get('equity_usdt', 0.0))} | "
-                    f"Fri ram {_fmt_usdt(runtime_cap.get('free_budget_usdt', 0.0))} | "
-                    f"Realiserat {runtime_cap.get('realized_pnl_usdt', 0.0):+.2f}"
+                    (
+                        f"Status: {'active' if mode in selected_live_modes else 'off'} | "
+                        f"Equity {_fmt_usdt(runtime_cap.get('equity_usdt', 0.0))} | "
+                        f"Free frame {_fmt_usdt(runtime_cap.get('free_budget_usdt', 0.0))} | "
+                        f"Realized {runtime_cap.get('realized_pnl_usdt', 0.0):+.2f}"
+                    )
+                    if english_ui else
+                    (
+                        f"Status: {'aktiv' if mode in selected_live_modes else 'av'} | "
+                        f"Eget kapital {_fmt_usdt(runtime_cap.get('equity_usdt', 0.0))} | "
+                        f"Fri ram {_fmt_usdt(runtime_cap.get('free_budget_usdt', 0.0))} | "
+                        f"Realiserat {runtime_cap.get('realized_pnl_usdt', 0.0):+.2f}"
+                    )
                 )
-        st.session_state.max_loss_usdt = st.number_input("Max förlust (USDT)", value=st.session_state.get('max_loss_usdt', 100.0))
+        st.session_state.max_loss_usdt = st.number_input("Max loss (USDT)" if english_ui else "Max förlust (USDT)", value=st.session_state.get('max_loss_usdt', 100.0))
         risk_cols = st.columns(2)
         with risk_cols[0]:
             st.session_state.max_simultaneous_positions = st.number_input(
-                "Max samtidiga positioner",
+                "Max simultaneous positions" if english_ui else "Max samtidiga positioner",
                 min_value=1,
                 max_value=25,
                 value=int(_clamp(st.session_state.get("max_simultaneous_positions", 3), 1, 25, 3)),
@@ -18121,13 +18366,12 @@ def settings_popup():
             )
         with risk_cols[1]:
             st.session_state.trade_cooldown_minutes = st.number_input(
-                "Cooldown per coin (min)",
+                "Cooldown per coin (min)" if english_ui else "Cooldown per coin (min)",
                 min_value=0,
                 max_value=1440,
                 value=int(_clamp(st.session_state.get("trade_cooldown_minutes", 240), 0, 1440, 240)),
                 step=5
             )
-        english_ui = is_english_language()
         risk_governor_settings = get_risk_governor_settings(saved_cfg)
         with st.expander("🛡️ RiskGovernor" if english_ui else "🛡️ RiskGovernor", expanded=False):
             st.caption(
@@ -18243,13 +18487,38 @@ def settings_popup():
                 if english_ui else
                 "Aktivera detta bara efter att KCS-avgiftsdragning är påslaget i ditt KuCoin-konto. Botten använder rabatterad modell i skanning, mocktest och live-PnL, men faktisk orderavgift från KuCoin används alltid när den finns."
             )
+
+            def _ensure_fee_number_input_default(setting_key, default_value):
+                input_key = f"{setting_key}_input"
+                current_value = st.session_state.get(input_key, fee_settings.get(setting_key, default_value))
+                try:
+                    current_number = float(current_value)
+                except Exception:
+                    current_number = float(default_value)
+                if current_number <= 0.0:
+                    st.session_state[input_key] = float(default_value)
+
+            st.session_state.setdefault(
+                "use_kcs_fee_discount_input",
+                bool(fee_settings.get("use_kcs_fee_discount", False))
+            )
+            _ensure_fee_number_input_default("base_trade_fee_pct", DEFAULT_FEE_MODEL_SETTINGS["base_trade_fee_pct"])
+            _ensure_fee_number_input_default("kcs_fee_discount_pct", DEFAULT_FEE_MODEL_SETTINGS["kcs_fee_discount_pct"])
+            _ensure_fee_number_input_default("min_kcs_reserve_usdt", DEFAULT_FEE_MODEL_SETTINGS["min_kcs_reserve_usdt"])
+            _ensure_fee_number_input_default("auto_buy_kcs_amount_usdt", DEFAULT_FEE_MODEL_SETTINGS["auto_buy_kcs_amount_usdt"])
+            _ensure_fee_number_input_default("auto_buy_kcs_min_usdt_balance", DEFAULT_FEE_MODEL_SETTINGS["auto_buy_kcs_min_usdt_balance"])
+            fee_settings = normalize_fee_model_settings({
+                key: st.session_state.get(f"{key}_input", fee_settings.get(key, default_value))
+                for key, default_value in DEFAULT_FEE_MODEL_SETTINGS.items()
+            })
+
             kcs_cols = st.columns(3)
             with kcs_cols[0]:
                 st.checkbox("Use KCS fee model" if english_ui else "Använd KCS-avgiftsmodell", value=bool(fee_settings.get("use_kcs_fee_discount", False)), key="use_kcs_fee_discount_input", help=("KuCoin must be configured to pay fees with KCS." if english_ui else "KuCoin-kontot måste vara inställt på att betala avgifter med KCS."))
             with kcs_cols[1]:
-                st.number_input("Base fee % per order" if english_ui else "Grundavgift % per order", min_value=0.0, max_value=2.0, step=0.01, value=float(fee_settings.get("base_trade_fee_pct", 0.10)), key="base_trade_fee_pct_input")
+                st.number_input("Base fee % per order" if english_ui else "Grundavgift % per order", min_value=0.0, max_value=2.0, step=0.01, value=float(fee_settings.get("base_trade_fee_pct", 0.10)), key="base_trade_fee_pct_input", help=("KuCoin's common base spot fee is 0.10% per order before account-level discounts." if english_ui else "KuCoins vanliga grundavgift för spot är 0,10% per order före kontorabatter."))
             with kcs_cols[2]:
-                st.number_input("Assumed KCS discount %" if english_ui else "Antagen KCS-rabatt %", min_value=0.0, max_value=80.0, step=1.0, value=float(fee_settings.get("kcs_fee_discount_pct", 20.0)), key="kcs_fee_discount_pct_input")
+                st.number_input("Assumed KCS discount %" if english_ui else "Antagen KCS-rabatt %", min_value=0.0, max_value=80.0, step=1.0, value=float(fee_settings.get("kcs_fee_discount_pct", 20.0)), key="kcs_fee_discount_pct_input", help=("20% means 0.10% becomes 0.08% per order in scans and estimated PnL." if english_ui else "20% innebär att 0,10% blir 0,08% per order i skanning och uppskattad PnL."))
             reserve_cols = st.columns(3)
             with reserve_cols[0]:
                 st.number_input("Minimum KCS reserve (USDT)" if english_ui else "Minsta KCS-reserv (USDT)", min_value=0.0, max_value=1000.0, step=1.0, value=float(fee_settings.get("min_kcs_reserve_usdt", 10.0)), key="min_kcs_reserve_usdt_input")
@@ -18262,6 +18531,20 @@ def settings_popup():
                 st.number_input("Auto-buy amount (USDT)" if english_ui else "Autoköp belopp (USDT)", min_value=0.0, max_value=100.0, step=1.0, value=float(fee_settings.get("auto_buy_kcs_amount_usdt", 5.0)), key="auto_buy_kcs_amount_usdt_input")
             with auto_cols[1]:
                 st.number_input("Minimum free USDT before auto-buy" if english_ui else "Min ledig USDT före autoköp", min_value=0.0, max_value=10000.0, step=5.0, value=float(fee_settings.get("auto_buy_kcs_min_usdt_balance", 25.0)), key="auto_buy_kcs_min_usdt_balance_input")
+            current_fee_settings = get_fee_model_settings(saved_cfg)
+            effective_fee_pct = get_trade_fee_rate(current_fee_settings) * 100.0
+            roundtrip_fee_pct = effective_fee_pct * 2.0
+            st.caption(
+                (
+                    f"Effective estimated fee: {effective_fee_pct:.4f}% per order "
+                    f"({roundtrip_fee_pct:.4f}% buy+sell round trip)."
+                )
+                if english_ui else
+                (
+                    f"Effektiv uppskattad avgift: {effective_fee_pct:.4f}% per order "
+                    f"({roundtrip_fee_pct:.4f}% köp+sälj tur och retur)."
+                )
+            )
             kcs_snapshot = st.session_state.get("kcs_balance_snapshot", {})
             if isinstance(kcs_snapshot, dict) and kcs_snapshot:
                 reserve_status = "OK" if kcs_snapshot.get("reserve_ok") else ("LOW" if english_ui else "LÅG")
@@ -18386,79 +18669,79 @@ def settings_popup():
                         st.error("Could not save login protection. See suppressed_errors.log." if english_ui else "Kunde inte spara login-skyddet. Se suppressed_errors.log.")
 
     with tab2:
-        st.subheader("Avancerade Strategifilter")
+        st.subheader("Advanced Strategy Filters" if english_ui else "Avancerade Strategifilter")
         tf_options = ['5m', '15m', '30m', '1h', '4h']
         current_tf = st.session_state.get('selected_timeframe', '1h')
         tf_index = tf_options.index(current_tf) if current_tf in tf_options else 3
         st.session_state.selected_timeframe = st.selectbox("Timeframe", tf_options, index=tf_index)
-        st.session_state.use_trend_filter = st.checkbox("Aktivera EMA 200 Trendfilter", value=st.session_state.get('use_trend_filter', True))
-        st.session_state.use_bb_filter = st.checkbox("Aktivera Bollinger Bands Volatilitetsskydd", value=st.session_state.get('use_bb_filter', False))
-        st.session_state.use_macd_filter = st.checkbox("Aktivera MACD Trendbekräftelse", value=st.session_state.get('use_macd_filter', False))
+        st.session_state.use_trend_filter = st.checkbox("Enable EMA 200 trend filter" if english_ui else "Aktivera EMA 200 Trendfilter", value=st.session_state.get('use_trend_filter', True))
+        st.session_state.use_bb_filter = st.checkbox("Enable Bollinger Bands volatility filter" if english_ui else "Aktivera Bollinger Bands Volatilitetsskydd", value=st.session_state.get('use_bb_filter', False))
+        st.session_state.use_macd_filter = st.checkbox("Enable MACD trend confirmation" if english_ui else "Aktivera MACD Trendbekräftelse", value=st.session_state.get('use_macd_filter', False))
         st.write("---")
-        st.markdown("**️ Nya Avancerade Smarta Filter:**")
-        st.session_state.use_ai_block_bear = st.checkbox("Aktivera AI Trend-Filter (Blockera alla köp helt vid BEAR)", value=st.session_state.get('use_ai_block_bear', False))
+        st.markdown("**️ New advanced smart filters:**" if english_ui else "**️ Nya Avancerade Smarta Filter:**")
+        st.session_state.use_ai_block_bear = st.checkbox("Enable AI trend filter (block all buys in BEAR)" if english_ui else "Aktivera AI Trend-Filter (Blockera alla köp helt vid BEAR)", value=st.session_state.get('use_ai_block_bear', False))
         s_col1, s_col2, s_col3 = st.columns(3)
         with s_col1:
             sent_drop_value = _clamp(st.session_state.get('sentiment_drop_threshold_pct', -4.0), -50.0, -0.1, -4.0)
-            st.session_state.sentiment_drop_threshold_pct = st.number_input("Bear-gräns prisfall (%)", min_value=-50.0, max_value=-0.1, value=sent_drop_value, step=0.5)
+            st.session_state.sentiment_drop_threshold_pct = st.number_input("Bear price-drop threshold (%)" if english_ui else "Bear-gräns prisfall (%)", min_value=-50.0, max_value=-0.1, value=sent_drop_value, step=0.5)
         with s_col2:
             sent_rsi_value = _clamp(st.session_state.get('sentiment_rsi_threshold', 35.0), 5.0, 60.0, 35.0)
-            st.session_state.sentiment_rsi_threshold = st.number_input("Bear-gräns RSI", min_value=5.0, max_value=60.0, value=sent_rsi_value, step=1.0)
+            st.session_state.sentiment_rsi_threshold = st.number_input("Bear RSI threshold" if english_ui else "Bear-gräns RSI", min_value=5.0, max_value=60.0, value=sent_rsi_value, step=1.0)
         with s_col3:
             sent_refresh_value = int(_clamp(st.session_state.get('sentiment_refresh_minutes', 15), 1, 240, 15))
             st.session_state.sentiment_refresh_minutes = st.number_input("Sentiment refresh (min)", min_value=1, max_value=240, value=sent_refresh_value, step=1)
-        st.session_state.use_volume_filter = st.checkbox("Aktivera Volym-kontroll (Kräv volym över Volume SMA 20)", value=st.session_state.get('use_volume_filter', False))
+        st.session_state.use_volume_filter = st.checkbox("Enable volume check (require volume above Volume SMA 20)" if english_ui else "Aktivera Volym-kontroll (Kräv volym över Volume SMA 20)", value=st.session_state.get('use_volume_filter', False))
         st.write("---")
-        st.markdown("**🧠 AI-Marknadsregimer & Volymflöde:**")
+        st.markdown("**🧠 AI market regimes & volume flow:**" if english_ui else "**🧠 AI-Marknadsregimer & Volymflöde:**")
         regime_options = ["Adaptive", "Trend", "Range", "Crash-block"]
         regime_value = st.session_state.get("market_regime_mode", "Adaptive")
         regime_index = regime_options.index(regime_value) if regime_value in regime_options else 0
-        st.session_state.market_regime_mode = st.selectbox("Regimlogik", regime_options, index=regime_index)
+        st.session_state.market_regime_mode = st.selectbox("Regime logic" if english_ui else "Regimlogik", regime_options, index=regime_index)
         rg1, rg2, rg3 = st.columns(3)
         with rg1:
-            st.session_state.cmf_threshold = st.number_input("CMF/kapitalflöde min", min_value=-1.0, max_value=1.0, value=float(_clamp(st.session_state.get("cmf_threshold", -0.05), -1.0, 1.0, -0.05)), step=0.01)
+            st.session_state.cmf_threshold = st.number_input("CMF/capital flow min" if english_ui else "CMF/kapitalflöde min", min_value=-1.0, max_value=1.0, value=float(_clamp(st.session_state.get("cmf_threshold", -0.05), -1.0, 1.0, -0.05)), step=0.01)
         with rg2:
-            st.session_state.volume_spike_mult = st.number_input("Volym-spike x SMA20", min_value=0.1, max_value=10.0, value=float(_clamp(st.session_state.get("volume_spike_mult", 1.0), 0.1, 10.0, 1.0)), step=0.1)
+            st.session_state.volume_spike_mult = st.number_input("Volume spike x SMA20" if english_ui else "Volym-spike x SMA20", min_value=0.1, max_value=10.0, value=float(_clamp(st.session_state.get("volume_spike_mult", 1.0), 0.1, 10.0, 1.0)), step=0.1)
         with rg3:
             st.session_state.bbw_threshold = st.number_input("BB Width squeeze max", min_value=0.0, max_value=1.0, value=float(_clamp(st.session_state.get("bbw_threshold", 0.0), 0.0, 1.0, 0.0)), step=0.005)
         fl1, fl2 = st.columns(2)
         with fl1:
-            st.session_state.squeeze_required = st.checkbox("Kräv BB/Keltner squeeze", value=bool(st.session_state.get("squeeze_required", False)))
+            st.session_state.squeeze_required = st.checkbox("Require BB/Keltner squeeze" if english_ui else "Kräv BB/Keltner squeeze", value=bool(st.session_state.get("squeeze_required", False)))
         with fl2:
-            st.session_state.htf_filter = st.checkbox("Kräv högre tidsrams-trend", value=bool(st.session_state.get("htf_filter", False)))
-        st.markdown("**🕒 Sessionsfilter:**")
+            st.session_state.htf_filter = st.checkbox("Require higher-timeframe trend" if english_ui else "Kräv högre tidsrams-trend", value=bool(st.session_state.get("htf_filter", False)))
+        st.markdown("**🕒 Session filter:**" if english_ui else "**🕒 Sessionsfilter:**")
         ss1, ss2, ss3 = st.columns(3)
         with ss1:
-            st.session_state.session_start_hour = st.number_input("Starttimme", min_value=0, max_value=23, value=int(_clamp(st.session_state.get("session_start_hour", 0), 0, 23, 0)), step=1)
+            st.session_state.session_start_hour = st.number_input("Start hour" if english_ui else "Starttimme", min_value=0, max_value=23, value=int(_clamp(st.session_state.get("session_start_hour", 0), 0, 23, 0)), step=1)
         with ss2:
-            st.session_state.session_end_hour = st.number_input("Sluttimme", min_value=0, max_value=23, value=int(_clamp(st.session_state.get("session_end_hour", 23), 0, 23, 23)), step=1)
+            st.session_state.session_end_hour = st.number_input("End hour" if english_ui else "Sluttimme", min_value=0, max_value=23, value=int(_clamp(st.session_state.get("session_end_hour", 23), 0, 23, 23)), step=1)
         with ss3:
-            st.session_state.weekday_mask = st.number_input("Veckomask (1-127)", min_value=1, max_value=127, value=int(_clamp(st.session_state.get("weekday_mask", 127), 1, 127, 127)), step=1)
+            st.session_state.weekday_mask = st.number_input("Weekday mask (1-127)" if english_ui else "Veckomask (1-127)", min_value=1, max_value=127, value=int(_clamp(st.session_state.get("weekday_mask", 127), 1, 127, 127)), step=1)
         st.write("---")
-        st.markdown("** RSI Köp-indikator tröskelvärden:**")
-        st.session_state.low_risk_factor = st.number_input("RSI-gräns STARK signal (Låg risk)", value=st.session_state.get('low_risk_factor', 25))
-        st.session_state.high_risk_factor = st.number_input("RSI-gräns NORMAL signal (Hög risk)", value=st.session_state.get('high_risk_factor', 35))
+        st.markdown("** RSI buy-signal thresholds:**" if english_ui else "** RSI Köp-indikator tröskelvärden:**")
+        st.session_state.low_risk_factor = st.number_input("RSI limit STRONG signal (low risk)" if english_ui else "RSI-gräns STARK signal (Låg risk)", value=st.session_state.get('low_risk_factor', 25))
+        st.session_state.high_risk_factor = st.number_input("RSI limit NORMAL signal (higher risk)" if english_ui else "RSI-gräns NORMAL signal (Hög risk)", value=st.session_state.get('high_risk_factor', 35))
         
     with tab3:
-        st.subheader("Vinstmål & Risksäkring")
-        st.session_state.dynamic_sizing = st.checkbox("Aktivera Dynamisk positionsstorlek", value=st.session_state.get('dynamic_sizing', False))
+        st.subheader("Profit Targets & Risk Protection" if english_ui else "Vinstmål & Risksäkring")
+        st.session_state.dynamic_sizing = st.checkbox("Enable dynamic position sizing" if english_ui else "Aktivera Dynamisk positionsstorlek", value=st.session_state.get('dynamic_sizing', False))
         st.write("---")
-        st.markdown("**⚙️ Säkringsmetod för nedsida (Stop Loss Taktik):**")
-        st.session_state.stop_loss_strategy = st.radio("Välj Stop Loss Taktik:", ["Fast (%)", "ATR-Krockkudde (Dynamisk)"], index=0 if st.session_state.get('stop_loss_strategy', 'Fast (%)') == "Fast (%)" else 1)
+        st.markdown("**⚙️ Downside protection method (Stop Loss tactic):**" if english_ui else "**⚙️ Säkringsmetod för nedsida (Stop Loss Taktik):**")
+        st.session_state.stop_loss_strategy = st.radio("Choose Stop Loss tactic:" if english_ui else "Välj Stop Loss Taktik:", ["Fast (%)", "ATR-Krockkudde (Dynamisk)"], index=0 if st.session_state.get('stop_loss_strategy', 'Fast (%)') == "Fast (%)" else 1)
         if st.session_state.stop_loss_strategy == "Fast (%)":
-            st.session_state.stop_loss_pct = st.number_input("Stop Loss (% fast förlust)", min_value=0.1, value=max(0.1, _safe_float(st.session_state.get('stop_loss_pct', 6.0), 6.0)), step=0.1)
+            st.session_state.stop_loss_pct = st.number_input("Stop Loss (% fixed loss)" if english_ui else "Stop Loss (% fast förlust)", min_value=0.1, value=max(0.1, _safe_float(st.session_state.get('stop_loss_pct', 6.0), 6.0)), step=0.1)
         else:
-            st.session_state.atr_multiplier = st.number_input("ATR-Multiplier (Bredd på krockkudde)", min_value=0.5, max_value=5.0, value=_clamp(st.session_state.get('atr_multiplier', 2.0), 0.5, 5.0, 2.0), step=0.1)
+            st.session_state.atr_multiplier = st.number_input("ATR multiplier (stop cushion width)" if english_ui else "ATR-Multiplier (Bredd på krockkudde)", min_value=0.5, max_value=5.0, value=_clamp(st.session_state.get('atr_multiplier', 2.0), 0.5, 5.0, 2.0), step=0.1)
             st.session_state.stop_loss_atr_mult = st.session_state.atr_multiplier
         st.write("---")
-        st.markdown("** Vinstmål live:**")
+        st.markdown("** Live profit target:**" if english_ui else "** Vinstmål live:**")
         tp_mode_options = ["Procent", "ATR"]
         tp_mode_value = st.session_state.get("take_profit_strategy", "Procent")
-        st.session_state.take_profit_strategy = st.radio("Take Profit-metod:", tp_mode_options, index=tp_mode_options.index(tp_mode_value) if tp_mode_value in tp_mode_options else 0, horizontal=True)
+        st.session_state.take_profit_strategy = st.radio("Take Profit method:" if english_ui else "Take Profit-metod:", tp_mode_options, index=tp_mode_options.index(tp_mode_value) if tp_mode_value in tp_mode_options else 0, horizontal=True)
         if st.session_state.take_profit_strategy == "ATR":
-            st.session_state.take_profit_atr_mult = st.number_input("Take Profit ATR-multiplikator", min_value=0.5, max_value=10.0, value=float(_clamp(st.session_state.get("take_profit_atr_mult", 2.0), 0.5, 10.0, 2.0)), step=0.1)
+            st.session_state.take_profit_atr_mult = st.number_input("Take Profit ATR multiplier" if english_ui else "Take Profit ATR-multiplikator", min_value=0.5, max_value=10.0, value=float(_clamp(st.session_state.get("take_profit_atr_mult", 2.0), 0.5, 10.0, 2.0)), step=0.1)
         else:
-            st.session_state.take_profit_pct = st.number_input("Take Profit (% vinst)", min_value=0.1, value=max(0.1, _safe_float(st.session_state.get('take_profit_pct', 8.0), 8.0)), step=0.1)
+            st.session_state.take_profit_pct = st.number_input("Take Profit (% gain)" if english_ui else "Take Profit (% vinst)", min_value=0.1, value=max(0.1, _safe_float(st.session_state.get('take_profit_pct', 8.0), 8.0)), step=0.1)
         time_exit_english = is_english_language()
         st.session_state.max_bars_in_trade = st.number_input(
             "Time exit: max candles in trade" if time_exit_english else "Time exit: max antal candles i trade",
@@ -18510,28 +18793,28 @@ def settings_popup():
                 ),
             )
         st.write("---")
-        st.markdown("**🔒 Trailing Stop Loss (Vinstsäkring):**")
-        st.session_state.use_trailing_stop = st.checkbox("Aktivera Trailing Stop Loss", value=st.session_state.get('use_trailing_stop', True))
+        st.markdown("**🔒 Trailing Stop Loss (profit protection):**" if english_ui else "**🔒 Trailing Stop Loss (Vinstsäkring):**")
+        st.session_state.use_trailing_stop = st.checkbox("Enable Trailing Stop Loss" if english_ui else "Aktivera Trailing Stop Loss", value=st.session_state.get('use_trailing_stop', True))
         trail_activation_value = max(0.1, min(50.0, _safe_float(st.session_state.get('trailing_activation_pct', 2.0), 2.0)))
         trail_distance_value = max(0.1, min(50.0, _safe_float(st.session_state.get('trailing_distance_pct', 1.5), 1.5)))
         tc1, tc2 = st.columns(2)
         with tc1:
-            st.session_state.trailing_activation_pct = st.number_input("Aktivera efter vinst (%)", min_value=0.1, max_value=50.0, value=trail_activation_value, step=0.1)
+            st.session_state.trailing_activation_pct = st.number_input("Activate after gain (%)" if english_ui else "Aktivera efter vinst (%)", min_value=0.1, max_value=50.0, value=trail_activation_value, step=0.1)
         with tc2:
-            st.session_state.trailing_distance_pct = st.number_input("Avstånd från topp (%)", min_value=0.1, max_value=50.0, value=trail_distance_value, step=0.1)
+            st.session_state.trailing_distance_pct = st.number_input("Distance from peak (%)" if english_ui else "Avstånd från topp (%)", min_value=0.1, max_value=50.0, value=trail_distance_value, step=0.1)
         st.write("---")
-        st.markdown("**🧱 Grid Trading (Sidledes marknad):**")
-        st.session_state.use_grid_trading = st.checkbox("Aktivera Grid Trading-modul", value=st.session_state.get('use_grid_trading', False))
+        st.markdown("**🧱 Grid Trading (sideways market):**" if english_ui else "**🧱 Grid Trading (Sidledes marknad):**")
+        st.session_state.use_grid_trading = st.checkbox("Enable Grid Trading module" if english_ui else "Aktivera Grid Trading-modul", value=st.session_state.get('use_grid_trading', False))
         grid_spacing_value = _clamp(st.session_state.get('grid_spacing_pct', 1.5), 0.1, 25.0, 1.5)
         grid_levels_value = int(_clamp(st.session_state.get('grid_levels', 3), 1, 20, 3))
         gc1, gc2 = st.columns(2)
         with gc1:
-            st.session_state.grid_spacing_pct = st.number_input("Grid-steg mellan köp/sälj (%)", min_value=0.1, max_value=25.0, value=grid_spacing_value, step=0.1)
+            st.session_state.grid_spacing_pct = st.number_input("Grid step between buy/sell (%)" if english_ui else "Grid-steg mellan köp/sälj (%)", min_value=0.1, max_value=25.0, value=grid_spacing_value, step=0.1)
         with gc2:
-            st.session_state.grid_levels = st.number_input("Antal grid-nivåer", min_value=1, max_value=20, value=grid_levels_value, step=1)
+            st.session_state.grid_levels = st.number_input("Number of grid levels" if english_ui else "Antal grid-nivåer", min_value=1, max_value=20, value=grid_levels_value, step=1)
         
     with tab4:
-        st.subheader("Kryptofördelning")
+        st.subheader("Crypto allocation" if english_ui else "Kryptofördelning")
         if 'allocations' not in st.session_state:
             st.session_state.allocations = {c: 0 for c in DEFAULT_SCAN_COIN_UNIVERSE_LIST}
             for c in ["BTC", "ETH", "LTC", "XRP"]:
@@ -18540,23 +18823,28 @@ def settings_popup():
         live_coin_options = get_coin_options_for_ui(st.session_state.allocations.keys())
         sync_live_col, equal_live_col = st.columns(2, gap="medium")
         with sync_live_col:
-            if st.button("🔄 Synka KuCoin-marknader", use_container_width=True, key="sync_kucoin_live_coin_options_btn"):
+            if st.button("🔄 Sync KuCoin markets" if english_ui else "🔄 Synka KuCoin-marknader", use_container_width=True, key="sync_kucoin_live_coin_options_btn"):
                 st.session_state.kucoin_coin_options = fetch_kucoin_usdt_coin_options()
-                st.toast(f"Hämtade {len(st.session_state.kucoin_coin_options)} aktiva KuCoin/USDT-marknader.", icon="🔄")
+                st.toast(
+                    f"Fetched {len(st.session_state.kucoin_coin_options)} active KuCoin/USDT markets."
+                    if english_ui else
+                    f"Hämtade {len(st.session_state.kucoin_coin_options)} aktiva KuCoin/USDT-marknader.",
+                    icon="🔄"
+                )
                 st.rerun()
         active_live_default = [coin for coin, pct in st.session_state.allocations.items() if _safe_float(pct, 0.0) > 0]
         if not active_live_default:
             active_live_default = ["BTC", "ETH", "LTC", "XRP"]
         active_live_default = [coin for coin in active_live_default if coin in live_coin_options]
         selected_live_coins = st.multiselect(
-            "Sök och välj kryptos som livebotten får använda:",
+            "Search and select coins the live bot may use:" if english_ui else "Sök och välj kryptos som livebotten får använda:",
             options=live_coin_options,
             default=active_live_default,
             key="live_coin_picker_input",
-            help="Endast valda coins får procentfält. Alla andra sätts till 0% när du sparar."
+            help="Only selected coins get allocation fields. All other coins are set to 0% when you save." if english_ui else "Endast valda coins får procentfält. Alla andra sätts till 0% när du sparar."
         )
         with equal_live_col:
-            if st.button("⚖️ Fördela valda jämnt", use_container_width=True, key="equalize_live_alloc_btn"):
+            if st.button("⚖️ Distribute selected evenly" if english_ui else "⚖️ Fördela valda jämnt", use_container_width=True, key="equalize_live_alloc_btn"):
                 selected_count = max(1, len(selected_live_coins))
                 base_pct = 100 // selected_count
                 pcts = [base_pct] * selected_count
@@ -18571,31 +18859,35 @@ def settings_popup():
                 st.session_state.allocations[coin] = 0
 
         if not selected_live_coins:
-            st.info("Välj minst en kryptovaluta för att visa procentfält.")
+            st.info("Select at least one cryptocurrency to show allocation fields." if english_ui else "Välj minst en kryptovaluta för att visa procentfält.")
 
         for coin in selected_live_coins:
             current_val = st.session_state.allocations.get(coin, 25)
             safe_alloc = int(_clamp(current_val, 0, 100, 0))
-            st.session_state.allocations[coin] = st.number_input(f"Andel för {coin} (%)", min_value=0, max_value=100, value=safe_alloc, step=5, key=f"ma_{coin}")
+            st.session_state.allocations[coin] = st.number_input(f"Allocation for {coin} (%)" if english_ui else f"Andel för {coin} (%)", min_value=0, max_value=100, value=safe_alloc, step=5, key=f"ma_{coin}")
         total_live_alloc = sum(_safe_float(st.session_state.allocations.get(coin, 0.0), 0.0) for coin in selected_live_coins)
         if selected_live_coins:
-            st.caption(f"Valda coins: {', '.join(selected_live_coins)} | Total fördelning: {total_live_alloc:.0f}%")
+            st.caption(
+                f"Selected coins: {', '.join(selected_live_coins)} | Total allocation: {total_live_alloc:.0f}%"
+                if english_ui else
+                f"Valda coins: {', '.join(selected_live_coins)} | Total fördelning: {total_live_alloc:.0f}%"
+            )
             if abs(total_live_alloc - 100.0) > 0.01:
-                st.warning("Total fördelning är inte 100%. Boten kan fortfarande spara, men live-risk blir tydligare om summan är 100%.")
+                st.warning("Total allocation is not 100%. The bot can still save it, but live risk is clearer when the total is 100%." if english_ui else "Total fördelning är inte 100%. Boten kan fortfarande spara, men live-risk blir tydligare om summan är 100%.")
     st.write("---")
     save_col, close_col = st.columns(2)
     with save_col:
-        if st.button("💾 Spara & Verkställ live", type="primary", width="stretch", key="global_dialog_save_btn"):
+        if st.button("💾 Save & apply live" if english_ui else "💾 Spara & Verkställ live", type="primary", width="stretch", key="global_dialog_save_btn"):
             try:
                 save_bot_config()
                 if st.session_state.get("running", False):
                     start_live_watchers_from_config(load_bot_config())
                 st.session_state.settings_open = False
-                st.toast("Inställningarna har sparats och rullats ut live! 🚀", icon="💾")
+                st.toast("Settings saved and applied live." if english_ui else "Inställningarna har sparats och rullats ut live! 🚀", icon="💾")
                 time.sleep(0.3); st.rerun()
-            except Exception as e: st.error(f"Kunde inte skriva till filen: {e}")
+            except Exception as e: st.error(f"Could not write to the file: {e}" if english_ui else f"Kunde inte skriva till filen: {e}")
     with close_col:
-        if st.button("❌ Avbryt och stäng", type="secondary", width="stretch", key="global_dialog_close_btn"):
+        if st.button("❌ Cancel and close" if english_ui else "❌ Avbryt och stäng", type="secondary", width="stretch", key="global_dialog_close_btn"):
             st.session_state.settings_open = False
             st.rerun()
 
@@ -18936,7 +19228,7 @@ with main_col_left:
     with analysis_header_col:
         show_analysis_log_window()
     with help_col:
-        if st.button("?", key="help_round_btn", help="Öppna hjälpavsnitt", width='stretch'):
+        if st.button("?", key="help_round_btn", help="Open help section" if is_english_language() else "Öppna hjälpavsnitt", width='stretch'):
             help_popup()
 
     mode_labels = [TRADING_MODE_LABELS["swing"], TRADING_MODE_LABELS["day"]]
@@ -19715,12 +20007,12 @@ if main_col_right is not None:
                     coin_col, allocation_col = st.columns(2, gap="large", vertical_alignment="top")
                     with coin_col:
                         selected_scan_coins = st.multiselect(
-                            "Valutor att djupskanna:",
+                            "Coins to deep scan:" if is_english_language() else "Valutor att djupskanna:",
                             options=coin_options,
                             default=selected_scan_default,
                             key="opt_coin_picker_input",
                             on_change=save_opt_fields_to_disk,
-                            help="Sök och välj KuCoin /USDT-coins. Texten sparas som kommaseparerad lista i bot_config.json."
+                            help="Search and select KuCoin /USDT coins. The list is saved comma-separated in bot_config.json." if is_english_language() else "Sök och välj KuCoin /USDT-coins. Texten sparas som kommaseparerad lista i bot_config.json."
                         )
                         opt_coins_raw = coin_list_to_raw(selected_scan_coins)
                         st.session_state.opt_coins_input = opt_coins_raw
@@ -20109,7 +20401,7 @@ if main_col_right is not None:
                     )
             
             with st.container(border=True):
-                st.checkbox("🚀 Starta Global Bakgrundsskanning", value=st.session_state.optimization_active, key="opt_state_click", on_change=save_optimization_and_alert_settings)
+                st.checkbox(translate_ui_text("🚀 Starta Global Bakgrundsskanning"), value=st.session_state.optimization_active, key="opt_state_click", on_change=save_optimization_and_alert_settings)
                 reconcile_optimization_checkbox_state()
                 render_optimization_status_fragment()
             
@@ -20484,30 +20776,32 @@ if main_col_right is not None:
                                 tp_label = f"TP ATR {r_tp_atr_mult}x"
                             else:
                                 tp_text = f"TP `{r_tp}%`"
-                                tp_label = f"TP {r_tp}%"
+                            tp_label = f"TP {r_tp}%"
                             if english_top3:
                                 if is_config_identical:
-                                    summary_diff = "Î” vs live: ⚖️ 0.00 USDT (0.00%) identical"
+                                    summary_diff = "Change vs live: ⚖️ 0.00 USDT (0.00%) identical"
                                 elif diff_profit > 0.1:
-                                    summary_diff = f"Î” vs live: 🟢 +{diff_profit:.2f} USDT (+{diff_pct:.2f}%) better"
+                                    summary_diff = f"Change vs live: 🟢 +{diff_profit:.2f} USDT (+{diff_pct:.2f}%) better"
                                 elif abs(diff_profit) <= 0.1:
-                                    summary_diff = f"Î” vs live: ⚖️ {diff_profit:+.2f} USDT ({diff_pct:+.2f}%) equivalent"
+                                    summary_diff = f"Change vs live: ⚖️ {diff_profit:+.2f} USDT ({diff_pct:+.2f}%) equivalent"
                                 else:
-                                    summary_diff = f"Î” vs live: 🔴 {diff_profit:.2f} USDT ({diff_pct:.2f}%) worse"
+                                    summary_diff = f"Change vs live: 🔴 {diff_profit:.2f} USDT ({diff_pct:.2f}%) worse"
                             else:
                                 if is_config_identical:
-                                    summary_diff = "Î” mot live: ⚖️ 0.00 USDT (0.00%) identisk"
+                                    summary_diff = "Skillnad mot live: ⚖️ 0.00 USDT (0.00%) identisk"
                                 elif diff_profit > 0.1:
-                                    summary_diff = f"Î” mot live: 🟢 +{diff_profit:.2f} USDT (+{diff_pct:.2f}%) bättre"
+                                    summary_diff = f"Skillnad mot live: 🟢 +{diff_profit:.2f} USDT (+{diff_pct:.2f}%) bättre"
                                 elif abs(diff_profit) <= 0.1:
-                                    summary_diff = f"Î” mot live: ⚖️ {diff_profit:+.2f} USDT ({diff_pct:+.2f}%) likvärdig"
+                                    summary_diff = f"Skillnad mot live: ⚖️ {diff_profit:+.2f} USDT ({diff_pct:+.2f}%) likvärdig"
                                 else:
-                                    summary_diff = f"Î” mot live: 🔴 {diff_profit:.2f} USDT ({diff_pct:.2f}%) sämre"
+                                    summary_diff = f"Skillnad mot live: 🔴 {diff_profit:.2f} USDT ({diff_pct:.2f}%) sämre"
                             missing_word = "missing" if english_top3 else "saknas"
-                            fit_delta_short = _metric_delta_text(r_fitness, live_reference_metrics.get('fitness'), 0).replace(f"Î” live: {missing_word}", f"Î”Fit {missing_word}").replace("Î” ", "Î”Fit ")
-                            sharpe_delta_short = _metric_delta_text(r_sharpe, live_reference_metrics.get('sharpe'), 2).replace(f"Î” live: {missing_word}", f"Î”Sharpe {missing_word}").replace("Î” ", "Î”Sharpe ")
-                            sortino_delta_short = _metric_delta_text(r_sortino, live_reference_metrics.get('sortino'), 2).replace(f"Î” live: {missing_word}", f"Î”Sortino {missing_word}").replace("Î” ", "Î”Sortino ")
-                            dd_delta_short = _metric_delta_text(r_dd, live_reference_metrics.get('max_dd'), 2, lower_is_better=True).replace(f"Î” live: {missing_word}", f"Î”DD {missing_word}").replace("Î” ", "Î”DD ")
+                            delta_word = "change" if english_top3 else "skillnad"
+                            missing_live_prefix = f"live {delta_word}: {missing_word}" if english_top3 else f"liveändring: {missing_word}"
+                            fit_delta_short = _metric_delta_text(r_fitness, live_reference_metrics.get('fitness'), 0).replace(missing_live_prefix, f"Fit {delta_word}: {missing_word}").replace(f"{delta_word} ", f"Fit {delta_word} ")
+                            sharpe_delta_short = _metric_delta_text(r_sharpe, live_reference_metrics.get('sharpe'), 2).replace(missing_live_prefix, f"Sharpe {delta_word}: {missing_word}").replace(f"{delta_word} ", f"Sharpe {delta_word} ")
+                            sortino_delta_short = _metric_delta_text(r_sortino, live_reference_metrics.get('sortino'), 2).replace(missing_live_prefix, f"Sortino {delta_word}: {missing_word}").replace(f"{delta_word} ", f"Sortino {delta_word} ")
+                            dd_delta_short = _metric_delta_text(r_dd, live_reference_metrics.get('max_dd'), 2, lower_is_better=True).replace(missing_live_prefix, f"DD {delta_word}: {missing_word}").replace(f"{delta_word} ", f"DD {delta_word} ")
                             metric_delta_parts = [
                                 part for part in [fit_delta_short, sharpe_delta_short, sortino_delta_short, dd_delta_short]
                                 if missing_word not in str(part).lower()
@@ -20572,8 +20866,13 @@ if main_col_right is not None:
                                 render_top3_metric_grid(metric_cards)
                                 result_label = "Result" if english_top3 else "Resultat"
                                 trade_unit = "trades" if english_top3 else "st"
+                                result_delta = (
+                                    summary_diff
+                                    .replace("Skillnad mot live: ", "")
+                                    .replace("Change vs live: ", "")
+                                )
                                 decision_cards = [
-                                    (result_label, f"{r_profit:+.2f} USDT", summary_diff.replace("Î” mot live: ", "").replace("Î” vs live: ", "")),
+                                    (result_label, f"{r_profit:+.2f} USDT", result_delta),
                                     ("Out-of-sample", f"{r_out_sample:+.2f} USDT", metric_quality('out_sample', r_out_sample)),
                                     ("Trades", f"{int(r['Total_Trades'])} {trade_unit}", metric_quality('trades', int(r['Total_Trades']), trading_mode=r_mode, scan_days=r_days_int)),
                                     ("Winrate", str(r['WinRate_Pct']), metric_quality('winrate', _safe_float(str(r['WinRate_Pct']).replace('%', '')))),
@@ -20774,7 +21073,7 @@ if main_col_right is not None:
         def on_asset_change(): st.session_state['chosen_graph_symbol'] = st.session_state['asset_dropdown_key']
         active_symbol = st.session_state.get('chosen_graph_symbol', graph_options)
         default_index = graph_options.index(active_symbol) if active_symbol in graph_options else 0
-        chosen_graph_symbol = st.selectbox("🎯 VÄLJ AKTIV KRYPTO FÖR GRAF & ORDERBOK:", options=graph_options, index=default_index, key="asset_dropdown_key", on_change=on_asset_change)
+        chosen_graph_symbol = st.selectbox(translate_ui_text("🎯 VÄLJ AKTIV KRYPTO FÖR GRAF & ORDERBOK:"), options=graph_options, index=default_index, key="asset_dropdown_key", on_change=on_asset_change)
         
         ob_key_bids = f"ob_bids_{chosen_graph_symbol}"
         ob_key_asks = f"ob_asks_{chosen_graph_symbol}"
@@ -20787,7 +21086,7 @@ if main_col_right is not None:
             st.session_state[ob_key_asks] = pd.DataFrame(m_asks, columns=['Sälj-pris (Asks)', 'Volym'])
             
         if st.session_state.get("optimization_active", False) or st.session_state.get("opt_thread_running", False) or opt_progress_is_recently_running(900):
-            st.caption("Orderboken är pausad i UI medan bakgrundsskanningen kör för att hålla sidan responsiv.")
+            st.caption(translate_ui_text("Orderboken är pausad i UI medan bakgrundsskanningen kör för att hålla sidan responsiv."))
         else:
             ob_col1, ob_col2 = st.columns(2)
             with ob_col1: st.dataframe(st.session_state[ob_key_bids], width='stretch', height=150, hide_index=True)
