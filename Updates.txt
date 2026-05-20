@@ -1,0 +1,19 @@
+Updates
+=======
+
+This file tracks new project updates from this point forward.
+Older completed work is intentionally not backfilled here.
+
+Format
+------
+Date:
+Area:
+Update:
+Impact:
+Verification:
+
+Date: 2026-05-20
+Area: Stabilization, scan diagnostics, regression testing
+Update: Added a safe regression test runner, added a lightweight scan-engine diagnostics UI panel, refreshed the public GitHub package and removed runtime/errorlog data from the upload folder.
+Impact: Worker engine type, worker count, scan rate, RAM cache status, CPU/process-RAM snapshot and fallback reason are easier to inspect without reading terminal logs. The GitHub package is cleaner and safer to publish.
+Verification: bot.py compiles, Streamlit returned HTTP 200 locally, regression tests passed, and the synthetic CPU benchmark showed worker scaling from 1 to 16 workers.
