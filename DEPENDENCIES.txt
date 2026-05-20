@@ -1,0 +1,61 @@
+DEPENDENCIES
+============
+
+Recommended Python version:
+
+- Python 3.11 or newer.
+
+
+Install commands
+----------------
+
+Windows:
+    install_dependencies.bat
+
+Ubuntu/Linux:
+    chmod +x install_dependencies.sh
+    ./install_dependencies.sh
+
+
+Python packages
+---------------
+
+Core packages:
+
+- streamlit
+- ccxt
+- pandas
+- numpy
+- ta
+- plotly
+- python-dotenv
+- requests
+
+Optimization / analytics:
+
+- optuna
+- scikit-learn
+- scipy
+
+Optional helper model file:
+
+- xgboost
+
+`predict.py` imports `xgboost`. If you do not use `predict.py`, the main bot can still run without using that helper directly, but the GitHub package includes `xgboost` in requirements so all included Python files have their declared dependencies.
+
+
+Ubuntu system packages
+----------------------
+
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git screen
+
+
+Optional but useful on VPS
+--------------------------
+
+- tailscale: private VPN access to the UI.
+- ufw: firewall rules.
+- caddy or nginx: reverse proxy if you later add a domain and HTTPS.
+
+For most private VPS setups, Tailscale + UFW is simpler and safer than exposing Streamlit publicly.

@@ -1,0 +1,94 @@
+HARDWARE REQUIREMENTS
+=====================
+
+The bot can technically start on weak hardware, but it is only worth using seriously if the machine has enough CPU for Streamlit, live monitoring and background scans at the same time.
+
+
+Practical minimum worth using
+-----------------------------
+
+CPU:
+    4 vCPU / 4 logical cores
+
+RAM:
+    8 GB
+
+Storage:
+    30+ GB SSD or NVMe
+
+OS:
+    Ubuntu 24.04 VPS or Windows 10/11
+
+Use case:
+    UI, live monitoring, Telegram reports, small scans and mock testing.
+
+
+Recommended for live trading + normal scanning
+----------------------------------------------
+
+CPU:
+    8 vCPU
+
+RAM:
+    16-24 GB
+
+Storage:
+    80+ GB NVMe preferred
+
+Use case:
+    Live bot plus regular background scanning without making the UI too slow.
+
+
+Recommended for heavy / Brutal VPS scanning
+-------------------------------------------
+
+CPU:
+    16 vCPU
+
+RAM:
+    32-64 GB
+
+Storage:
+    150+ GB NVMe
+
+Network:
+    Stable VPS network. A 1 Gbit/s port is useful, but CPU, RAM bandwidth and disk latency matter more for scanning.
+
+Use case:
+    Larger search spaces, heavier Bayesian/matrix scans, multiple coins/timeframes and longer running scan cycles.
+
+
+Not recommended
+---------------
+
+- 1 vCPU / 1 GB RAM VPS plans.
+- Free/shared hosting.
+- Machines that sleep or suspend.
+- Slow HDD-only storage for heavy scanning.
+- Publicly exposed Streamlit without VPN/reverse proxy/firewall planning.
+
+
+Worker guidance
+---------------
+
+Do not give every CPU thread to the scanner.
+
+On a 16 vCPU VPS:
+    Reserve about 4 cores for UI/live trading.
+    Use roughly 8-12 workers for heavy scans.
+
+On an 8 vCPU VPS:
+    Reserve about 2-3 cores for UI/live trading.
+    Use roughly 4-6 workers for heavier scans.
+
+On a 4 vCPU VPS:
+    Keep scans small.
+    Use roughly 1-2 workers.
+
+More workers are not always faster. If workers wait on data preparation, disk writes, memory bandwidth or Python overhead, adding workers can make the UI slower without improving scan speed much.
+
+
+Important note
+--------------
+
+Better hardware improves scan throughput and UI headroom. It does not guarantee profitable trades.

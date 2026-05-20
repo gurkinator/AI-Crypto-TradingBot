@@ -1,0 +1,113 @@
+HOW TO GET STARTED
+==================
+
+This is early beta trading software for KuCoin spot trading. Use tiny amounts first.
+
+1. Install Python
+-----------------
+
+Use Python 3.11 or newer.
+
+Windows:
+    Install Python from python.org or Microsoft Store.
+    Make sure Python is available in PATH.
+
+Ubuntu 24.04:
+    sudo apt update
+    sudo apt install -y python3 python3-venv python3-pip git screen
+
+
+2. Install dependencies
+-----------------------
+
+Windows:
+    Double-click:
+        install_dependencies.bat
+
+Ubuntu/Linux:
+    chmod +x install_dependencies.sh
+    ./install_dependencies.sh
+
+
+3. Create your .env file
+------------------------
+
+Copy:
+    example.env
+
+Rename the copy to:
+    .env
+
+Fill in your own KuCoin and Telegram credentials.
+
+Never upload .env to GitHub.
+
+
+4. Start the bot
+----------------
+
+Windows:
+    venv\Scripts\activate
+    streamlit run bot.py --server.address 0.0.0.0 --server.port 8501
+
+Ubuntu/VPS:
+    screen -S tradingbot
+    source venv/bin/activate
+    streamlit run bot.py --server.address 0.0.0.0 --server.port 8501
+
+Detach from screen:
+    CTRL+A, then D
+
+Reconnect to screen:
+    screen -r tradingbot
+
+
+5. Open the UI
+--------------
+
+Local machine:
+    http://localhost:8501
+
+VPS:
+    http://YOUR_SERVER_IP:8501
+
+Safer remote access:
+    Use Tailscale or another private VPN instead of exposing Streamlit publicly.
+
+
+6. First safe test
+------------------
+
+Recommended sequence:
+
+    1. Keep live trading off.
+    2. Configure Telegram and send a test message.
+    3. Run Test Live Settings.
+    4. Run a small background scan.
+    5. Review the Top 3 strategy cards.
+    6. Check the Active holdings / open positions panel.
+    7. Enable live trading only with tiny capital.
+
+
+7. Optional login wall
+----------------------
+
+The login wall is off by default.
+
+If you enable it in Settings:
+
+    - The chosen password is saved as a PBKDF2-SHA256 hash.
+    - No clear-text password should be stored in bot.py, bot_config.json or .env.
+    - secure_auth.json is runtime/private and must not be uploaded to GitHub.
+
+
+8. KCS fee model
+----------------
+
+If you want the bot to model KuCoin KCS fee discounts:
+
+    1. Enable KCS fee deduction inside your KuCoin account.
+    2. Keep a small KCS balance.
+    3. Enable the KCS fee model in the bot settings.
+
+The bot can model and monitor this. It cannot force KuCoin to use KCS per order through ccxt.
